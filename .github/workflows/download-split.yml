@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to download (xnxx page URL or direct CDN link)'
+        description: 'xnxx page URL or any direct video URL'
         required: true
       folder:
         description: 'Output folder name'
@@ -25,7 +25,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Download and push
+      - name: Setup Python + Playwright
+        run: |
+          pip install playwright --quiet
+          playwright install chromium --with-deps --quiet
+
+      - name: Extract CDN link (if needed) and download
         run: |
           INPUT_URL="${{ github.event.inputs.url }}"
           FOLDER="${{ github.event.inputs.folder }}"
@@ -35,66 +40,129 @@ jobs:
 
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-          # ──────────────────────────────────────────────────────────────────
-          # مرحله ۱: اگه URL صفحه xnxx هست، لینک CDN رو از HTML استخراج کن
-          # ──────────────────────────────────────────────────────────────────
-          if echo "$INPUT_URL" | grep -qi 'xnxx\.com/video'; then
-            echo "==> Detected xnxx page URL. Extracting CDN link from server..."
-            REFERER="$INPUT_URL"
+          # ────────────────────────────────────────────────────────────────
+          # مرحله ۱: استخراج لینک CDN با Playwright (اگه صفحه ویدیو باشه)
+          # ────────────────────────────────────────────────────────────────
+          IS_VIDEO_PAGE=0
+          echo "$INPUT_URL" | grep -qiP 'xnxx\.com/video|xvideos\.com/video|pornhub\.com/view_video|xhamster\.com/videos|redtube\.com/|youporn\.com/watch' && IS_VIDEO_PAGE=1
 
-            HTML=$(curl -sL \
-              -H "User-Agent: $UA" \
-              -H "Accept: text/html,application/xhtml+xml,*/*" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              --max-time 30 \
-              "$INPUT_URL")
+          if [ "$IS_VIDEO_PAGE" -eq 1 ]; then
+            echo "==> Video page detected. Running Playwright extractor..."
 
-            CDN_URL=""
+            python3 - <<'PYEOF'
+import asyncio, sys, os, re
+from urllib.parse import urlparse
 
-            # روش ۱: html5player.setVideoUrl('...')
-            CDN_URL=$(echo "$HTML" | grep -oP "html5player\.setVideoUrl\('\K[^']+" | head -1)
-            [ -n "$CDN_URL" ] && echo "Found via setVideoUrl"
+INPUT_URL = os.environ.get("INPUT_URL", "")
 
-            # روش ۲: html5player.setVideoUrlHigh('...')
+SKIP = ['thumb','preview','poster','banner','logo','icon',
+        'sprite','storyboard','tracking','analytics','pixel','ad/','/ads/']
+CDN_HINTS = ['xnxx-cdn.com','rdtcdn.com','phncdn.com','mp4-cdn',
+             'kv-ph.','ev-ph.','di-ph.','p300cdn','googlevideo.com',
+             'videoplayback','x-tg.tube/get_file']
+
+def should_capture(url, ct=""):
+    ul = url.lower()
+    if any(k in ul for k in SKIP): return False
+    if 'video/' in ct: return True
+    if any(e in ul for e in ['.mp4','.webm','.mkv','.m3u8','.ts','.flv']): return True
+    if any(d in ul for d in CDN_HINTS): return True
+    return False
+
+async def extract(page_url):
+    from playwright.async_api import async_playwright
+    captured = []
+    seen = set()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox','--disable-gpu','--disable-dev-shm-usage',
+                  '--disable-software-rasterizer','--mute-audio']
+        )
+        ctx = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                       'Chrome/124.0.0.0 Safari/537.36',
+            viewport={'width':1280,'height':720},
+            locale='en-US',
+        )
+        page = await ctx.new_page()
+
+        async def on_resp(response):
+            try:
+                ru = response.url
+                ct = response.headers.get('content-type','')
+                if should_capture(ru, ct):
+                    norm = ru.split('?')[0]
+                    if norm not in seen:
+                        seen.add(norm)
+                        captured.append(ru)
+            except: pass
+
+        page.on('response', on_resp)
+
+        print(f"[PY] Loading: {page_url}", flush=True)
+        await page.goto(page_url, wait_until='domcontentloaded', timeout=60000)
+
+        # age gate
+        for sel in ['button:has-text("I AM 18")','button:has-text("ENTER")',
+                    'button:has-text("Yes")','button.y','a:has-text("I AM 18")']:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=800):
+                    await el.click()
+                    await asyncio.sleep(1.5)
+                    break
+            except: pass
+
+        # play to trigger network requests
+        for _ in range(3):
+            await page.wait_for_timeout(3000)
+            try:
+                await page.evaluate('()=>{try{document.querySelector("video")?.play()}catch(e){}}')
+            except: pass
+            if captured: break
+
+        await browser.close()
+
+    return captured
+
+urls = asyncio.run(extract(INPUT_URL))
+if urls:
+    # ترجیح: لینک‌های mp4 بر m3u8
+    mp4s = [u for u in urls if '.mp4' in u.lower()]
+    best = mp4s[0] if mp4s else urls[0]
+    print(f"[PY] CDN_URL={best}", flush=True)
+    with open("/tmp/cdn_url.txt","w") as f: f.write(best)
+else:
+    print("[PY] ERROR: No video URL found", flush=True)
+    sys.exit(1)
+PYEOF
+
+            # خواندن URL از فایل temp
+            CDN_URL=$(cat /tmp/cdn_url.txt 2>/dev/null || echo "")
             if [ -z "$CDN_URL" ]; then
-              CDN_URL=$(echo "$HTML" | grep -oP "html5player\.setVideoUrlHigh\('\K[^']+" | head -1)
-              [ -n "$CDN_URL" ] && echo "Found via setVideoUrlHigh"
-            fi
-
-            # روش ۳: "url":"https://...mp4..."
-            if [ -z "$CDN_URL" ]; then
-              CDN_URL=$(echo "$HTML" | grep -oP '"url"\s*:\s*"\K[^"]+\.mp4[^"]*' | head -1)
-              [ -n "$CDN_URL" ] && echo "Found via json url key"
-            fi
-
-            # روش ۴: هر URL که xnxx-cdn یا mp4-cdn داشته باشه
-            if [ -z "$CDN_URL" ]; then
-              CDN_URL=$(echo "$HTML" | grep -oP "https://[^\"'<>\s]*(xnxx-cdn|mp4-cdn)[^\"'<>\s]*\.mp4[^\"'<>\s]*" | head -1)
-              [ -n "$CDN_URL" ] && echo "Found via cdn domain pattern"
-            fi
-
-            if [ -z "$CDN_URL" ]; then
-              echo "ERROR: Could not extract CDN URL from xnxx page."
-              echo "--- HTML snippet ---"
-              echo "$HTML" | head -c 2000
+              echo "ERROR: Playwright could not extract CDN URL."
               exit 1
             fi
 
             URL="$CDN_URL"
+            REFERER="$INPUT_URL"
             echo "==> Extracted CDN URL: $URL"
 
           else
             # لینک مستقیم — همونطور پاس شده
             URL="$INPUT_URL"
             REFERER=$(echo "$INPUT_URL" | grep -oP 'https?://[^/]+/')
-            echo "==> Direct URL, no extraction needed."
+            echo "==> Direct URL, using as-is."
           fi
 
           echo "==> Referer: $REFERER"
 
-          # ──────────────────────────────────────────────────────────────────
+          # ────────────────────────────────────────────────────────────────
           # مرحله ۲: هدرها و نام فایل
-          # ──────────────────────────────────────────────────────────────────
+          # ────────────────────────────────────────────────────────────────
           HEADERS=$(curl -sI -L \
             -H "User-Agent: $UA" \
             -H "Referer: $REFERER" \
@@ -125,9 +193,9 @@ jobs:
             echo "Filename with extension: $FILENAME"
           fi
 
-          # ──────────────────────────────────────────────────────────────────
+          # ────────────────────────────────────────────────────────────────
           # مرحله ۳: دانلود
-          # ──────────────────────────────────────────────────────────────────
+          # ────────────────────────────────────────────────────────────────
           echo "Downloading: $URL  ->  $FILENAME"
           curl -L --retry 5 --retry-delay 3 --retry-all-errors \
                --connect-timeout 30 --max-time 3600 \
@@ -162,9 +230,9 @@ jobs:
 
           echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
 
-          # ──────────────────────────────────────────────────────────────────
-          # مرحله ۴: split و push
-          # ──────────────────────────────────────────────────────────────────
+          # ────────────────────────────────────────────────────────────────
+          # مرحله ۴: split و push به گیت
+          # ────────────────────────────────────────────────────────────────
           if [ "$SIZE" -le "$MAX" ]; then
             echo "Small file — no split needed."
             cp "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_0001_${FILENAME}"
@@ -219,3 +287,5 @@ jobs:
 
             echo "All $TOTAL chunks pushed."
           fi
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
