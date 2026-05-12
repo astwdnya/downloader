@@ -737,18 +737,21 @@ class DownloaderApp(tk.Tk):
 
     # ─── GitHub helpers ───────────────────────────────────────────────────────
     def _wait_for_folder(self, repo, folder, branch, timeout=3600):
+        """Wait until done.txt appears in folder/chunks/ — means all chunks are pushed."""
         deadline = time.time() + timeout
+        done_path = f"{folder}/chunks/done.txt"
         while time.time() < deadline:
             if self._abort.is_set():
                 raise Exception("Aborted while waiting for folder.")
             try:
-                repo.get_contents(folder, ref=branch)
-                time.sleep(5)
+                repo.get_contents(done_path, ref=branch)
+                # done.txt found — all chunks are committed, get latest sha
+                time.sleep(3)
                 return repo.get_commits(sha=branch)[0].sha
             except Exception:
-                time.sleep(5)
+                time.sleep(8)
         raise TimeoutError(
-            f"Folder '{folder}' did not appear within "
+            f"done.txt did not appear in '{folder}/chunks/' within "
             f"{timeout // 60} min.")
 
     def _download_folder(self, session, token, owner, repo_name,
