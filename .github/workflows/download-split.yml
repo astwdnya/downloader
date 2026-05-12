@@ -29,17 +29,46 @@ jobs:
 
       - name: Download file
         run: |
-          mkdir -p "${{ github.event.inputs.folder_name }}/chunks"
-
           URL="${{ github.event.inputs.file_url }}"
           FOLDER="${{ github.event.inputs.folder_name }}"
+          mkdir -p "$FOLDER/chunks"
 
-          # Get filename from URL (strip query string)
-          FILENAME=$(basename "${URL%%\?*}")
+          # Try to get real filename from Content-Disposition header
+          HEADERS=$(curl -sI -L "$URL")
+          CD=$(echo "$HEADERS" | grep -i 'content-disposition' | grep -oP 'filename="?\K[^";\r\n]+' | head -1)
+
+          if [ -n "$CD" ]; then
+            FILENAME="$CD"
+            echo "Filename from Content-Disposition: $FILENAME"
+          else
+            # Fall back to URL path, strip query string
+            URLPATH="${URL%%\?*}"
+            FILENAME=$(basename "$URLPATH")
+            echo "Filename from URL: $FILENAME"
+          fi
+
+          # If still no extension, try Content-Type
+          if [[ "$FILENAME" != *.* ]]; then
+            CT=$(echo "$HEADERS" | grep -i '^content-type:' | head -1 | tr -d '\r')
+            case "$CT" in
+              *video/mp4*)   FILENAME="${FILENAME}.mp4" ;;
+              *video/webm*)  FILENAME="${FILENAME}.webm" ;;
+              *video/x-matroska*) FILENAME="${FILENAME}.mkv" ;;
+              *image/jpeg*)  FILENAME="${FILENAME}.jpg" ;;
+              *image/png*)   FILENAME="${FILENAME}.png" ;;
+              *audio/mpeg*)  FILENAME="${FILENAME}.mp3" ;;
+              *application/zip*) FILENAME="${FILENAME}.zip" ;;
+              *application/octet-stream*)
+                # Try to detect from first bytes after download
+                FILENAME="${FILENAME}.bin" ;;
+            esac
+            echo "Filename with extension: $FILENAME"
+          fi
+
           echo "FILENAME=$FILENAME" >> $GITHUB_ENV
           echo "FOLDER=$FOLDER"     >> $GITHUB_ENV
 
-          echo "Downloading: $URL"
+          echo "Downloading: $URL -> $FOLDER/$FILENAME"
           curl -L --retry 5 --retry-delay 3 --retry-all-errors \
                --connect-timeout 30 --max-time 3600 \
                -o "$FOLDER/$FILENAME" \
@@ -49,76 +78,76 @@ jobs:
           echo "Downloaded: $FILENAME  ($SIZE bytes)"
           echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
 
-      - name: Split into 90 MB chunks (if needed)
+          # If file was .bin, detect real type from magic bytes
+          if [[ "$FILENAME" == *.bin ]]; then
+            MAGIC=$(file --brief "$FOLDER/$FILENAME")
+            case "$MAGIC" in
+              *MP4*|*MPEG*|*ISO Media*) 
+                NEW="${FILENAME%.bin}.mp4"
+                mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
+                FILENAME="$NEW"
+                echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+                ;;
+              *Matroska*) 
+                NEW="${FILENAME%.bin}.mkv"
+                mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
+                FILENAME="$NEW"
+                echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+                ;;
+            esac
+          fi
+
+      - name: Split into chunks and push each one
         run: |
           FOLDER="${{ github.event.inputs.folder_name }}"
-          FILENAME="$FILENAME"
           MAX=94371840   # 90 MB in bytes
 
           SIZE=$(stat -c%s "$FOLDER/$FILENAME")
+          echo "File: $FILENAME  Size: $SIZE bytes"
 
           if [ "$SIZE" -le "$MAX" ]; then
-            echo "File is small enough, no split needed."
-            # Move directly into chunks/ so GUI always finds files there
-            mv "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_001_$FILENAME"
-            echo "CHUNKED=false" >> $GITHUB_ENV
-          else
-            echo "Splitting into 90MB chunks..."
-            split -b "$MAX" -d -a 4 "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_"
-            # Rename chunks to have zero-padded numeric names
-            i=1
-            for f in "$FOLDER/chunks/"chunk_*; do
-              new=$(printf "$FOLDER/chunks/chunk_%04d" $i)
-              mv "$f" "$new"
-              i=$((i+1))
-            done
+            echo "Small file — no split needed."
+            # Single chunk with original filename embedded
+            cp "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_0001_${FILENAME}"
             rm "$FOLDER/$FILENAME"
-            echo "CHUNKED=true"  >> $GITHUB_ENV
-            echo "Total chunks: $((i-1))"
-          fi
 
-          ls -lh "$FOLDER/chunks/"
-
-      - name: Push chunks to repo
-        run: |
-          FOLDER="${{ github.event.inputs.folder_name }}"
-          MAX_PUSH=94000000   # push in batches if many chunks
-
-          git add "$FOLDER/chunks/"
-
-          # Check if anything was staged
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
-          fi
-
-          # Commit in small batches to avoid push size limits
-          # Each git push must stay under 2GB total, but single files < 100MB
-          BATCH=()
-          BATCH_SIZE=0
-
-          for f in "$FOLDER"/chunks/chunk_*; do
-            FSIZE=$(stat -c%s "$f")
-            BATCH+=("$f")
-            BATCH_SIZE=$((BATCH_SIZE + FSIZE))
-
-            # Push batch when it reaches ~300MB or end of files
-            if [ "$BATCH_SIZE" -ge 314572800 ]; then
-              git add "${BATCH[@]}"
-              git commit -m "add chunks batch [ci skip]"
-              git push
-              BATCH=()
-              BATCH_SIZE=0
-              sleep 3
-            fi
-          done
-
-          # Commit remaining
-          if [ ${#BATCH[@]} -gt 0 ]; then
-            git add "${BATCH[@]}"
-          fi
-
-          if ! git diff --cached --quiet; then
-            git commit -m "download: $FILENAME -> $FOLDER [ci skip]"
+            git add "$FOLDER/chunks/chunk_0001_${FILENAME}"
+            git commit -m "download: $FILENAME [$FOLDER] [ci skip]"
             git push
+          else
+            echo "Splitting $FILENAME into 90 MB chunks..."
+            # split produces: chunk_0000, chunk_0001, ... (numeric suffix via -d -a 4)
+            split -b "$MAX" -d -a 4 "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_"
+            rm "$FOLDER/$FILENAME"
+
+            TOTAL=$(ls "$FOLDER/chunks/" | wc -l)
+            echo "Total chunks: $TOTAL"
+            ls -lh "$FOLDER/chunks/"
+
+            # Save total and filename for GUI to know the real name
+            echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
+
+            # Push EACH chunk individually to stay under GitHub's 100MB limit
+            i=0
+            for CHUNK in $(ls "$FOLDER/chunks/chunk_"* | sort); do
+              CNAME=$(basename "$CHUNK")
+              CSIZE=$(stat -c%s "$CHUNK")
+              echo "Pushing $CNAME  ($CSIZE bytes)..."
+
+              git add "$CHUNK"
+              git commit -m "chunk $CNAME [$FOLDER] [ci skip]"
+              git push
+
+              i=$((i+1))
+              echo "Pushed $i / $TOTAL"
+              # Small pause between pushes to avoid rate limiting
+              sleep 2
+            done
+
+            # Push filename.txt
+            git add "$FOLDER/chunks/filename.txt"
+            git commit -m "meta: filename.txt [$FOLDER] [ci skip]"
+            git push
+
+            echo "All $TOTAL chunks pushed successfully."
           fi
