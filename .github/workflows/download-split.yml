@@ -9,6 +9,10 @@ on:
       folder:
         description: 'Output folder name'
         required: true
+      referer:
+        description: 'Referer header (e.g. https://www.xnxx.com)'
+        required: false
+        default: ''
 
 jobs:
   download:
@@ -29,15 +33,24 @@ jobs:
         run: |
           URL="${{ github.event.inputs.url }}"
           FOLDER="${{ github.event.inputs.folder }}"
+          REFERER_INPUT="${{ github.event.inputs.referer }}"
           MAX=94371840
 
           mkdir -p "$FOLDER/chunks"
 
           DOMAIN=$(echo "$URL" | grep -oP 'https?://[^/]+')
 
+          # اگر referer مستقیم پاس شده از اون استفاده کن، در غیر این صورت از domain
+          if [ -n "$REFERER_INPUT" ]; then
+            REFERER="$REFERER_INPUT"
+          else
+            REFERER="$DOMAIN/"
+          fi
+          echo "Using Referer: $REFERER"
+
           HEADERS=$(curl -sI -L \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-            -H "Referer: $DOMAIN/" \
+            -H "Referer: $REFERER" \
             -H "Accept: */*" \
             "$URL")
 
@@ -69,7 +82,7 @@ jobs:
           curl -L --retry 5 --retry-delay 3 --retry-all-errors \
                --connect-timeout 30 --max-time 3600 \
                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
-               -H "Referer: $DOMAIN/" \
+               -H "Referer: $REFERER" \
                -H "Accept: video/webm,video/mp4,video/*,*/*;q=0.8" \
                -H "Accept-Language: en-US,en;q=0.9" \
                -o "$FOLDER/$FILENAME" "$URL"
