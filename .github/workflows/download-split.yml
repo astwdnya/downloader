@@ -1,54 +1,124 @@
-name: Download Large File, Split, and Commit to Repo
+name: Download and Split
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct download URL of the large file'
+        description: "Direct URL of the file to download"
         required: true
       folder_name:
-        description: 'Timestamp folder name (MMDDHHMMSS) provided by Python script'
+        description: "Target folder name in repo"
         required: true
 
 jobs:
-  split-and-commit:
+  download:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 1
 
-      - name: Download large file into the specified folder
+      - name: Configure Git
         run: |
-          mkdir -p "${{ github.event.inputs.folder_name }}"
-          curl --fail -k -L --max-redirs 50 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -c cookies.txt -b cookies.txt \
-            -o "${{ github.event.inputs.folder_name }}/downloaded_file" \
-            "${{ github.event.inputs.file_url }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Check file size and either split or rename
+      - name: Download file
+        run: |
+          mkdir -p "${{ github.event.inputs.folder_name }}/chunks"
+
+          URL="${{ github.event.inputs.file_url }}"
+          FOLDER="${{ github.event.inputs.folder_name }}"
+
+          # Get filename from URL (strip query string)
+          FILENAME=$(basename "${URL%%\?*}")
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+          echo "FOLDER=$FOLDER"     >> $GITHUB_ENV
+
+          echo "Downloading: $URL"
+          curl -L --retry 5 --retry-delay 3 --retry-all-errors \
+               --connect-timeout 30 --max-time 3600 \
+               -o "$FOLDER/$FILENAME" \
+               "$URL"
+
+          SIZE=$(stat -c%s "$FOLDER/$FILENAME")
+          echo "Downloaded: $FILENAME  ($SIZE bytes)"
+          echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
+
+      - name: Split into 90 MB chunks (if needed)
         run: |
           FOLDER="${{ github.event.inputs.folder_name }}"
-          FILE_PATH="$FOLDER/downloaded_file"
-          SIZE_MB=$(du -m "$FILE_PATH" | cut -f1)
+          FILENAME="$FILENAME"
+          MAX=94371840   # 90 MB in bytes
 
-          if [ "$SIZE_MB" -lt 95 ]; then
-            echo "File is ${SIZE_MB}MB (<95MB) – keeping as single file named after folder"
-            mv "$FILE_PATH" "$FOLDER/$FOLDER"
+          SIZE=$(stat -c%s "$FOLDER/$FILENAME")
+
+          if [ "$SIZE" -le "$MAX" ]; then
+            echo "File is small enough, no split needed."
+            # Move directly into chunks/ so GUI always finds files there
+            mv "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_001_$FILENAME"
+            echo "CHUNKED=false" >> $GITHUB_ENV
           else
-            echo "File is ${SIZE_MB}MB (>=95MB) – splitting into 95MB chunks"
-            mkdir -p "$FOLDER/chunks"
-            split -b 95M "$FILE_PATH" "$FOLDER/chunks/chunk_"
-            rm "$FILE_PATH"
+            echo "Splitting into 90MB chunks..."
+            split -b "$MAX" -d -a 4 "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_"
+            # Rename chunks to have zero-padded numeric names
+            i=1
+            for f in "$FOLDER/chunks/"chunk_*; do
+              new=$(printf "$FOLDER/chunks/chunk_%04d" $i)
+              mv "$f" "$new"
+              i=$((i+1))
+            done
+            rm "$FOLDER/$FILENAME"
+            echo "CHUNKED=true"  >> $GITHUB_ENV
+            echo "Total chunks: $((i-1))"
           fi
 
-      - name: Commit and push the new folder
+          ls -lh "$FOLDER/chunks/"
+
+      - name: Push chunks to repo
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.folder_name }}"
-          git commit -m "Add ${{ github.event.inputs.folder_name }} from ${{ github.event.inputs.file_url }}" || echo "No changes"
-          git push
+          FOLDER="${{ github.event.inputs.folder_name }}"
+          MAX_PUSH=94000000   # push in batches if many chunks
+
+          git add "$FOLDER/chunks/"
+
+          # Check if anything was staged
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          # Commit in small batches to avoid push size limits
+          # Each git push must stay under 2GB total, but single files < 100MB
+          BATCH=()
+          BATCH_SIZE=0
+
+          for f in "$FOLDER"/chunks/chunk_*; do
+            FSIZE=$(stat -c%s "$f")
+            BATCH+=("$f")
+            BATCH_SIZE=$((BATCH_SIZE + FSIZE))
+
+            # Push batch when it reaches ~300MB or end of files
+            if [ "$BATCH_SIZE" -ge 314572800 ]; then
+              git add "${BATCH[@]}"
+              git commit -m "add chunks batch [ci skip]"
+              git push
+              BATCH=()
+              BATCH_SIZE=0
+              sleep 3
+            fi
+          done
+
+          # Commit remaining
+          if [ ${#BATCH[@]} -gt 0 ]; then
+            git add "${BATCH[@]}"
+          fi
+
+          if ! git diff --cached --quiet; then
+            git commit -m "download: $FILENAME -> $FOLDER [ci skip]"
+            git push
+          fi
