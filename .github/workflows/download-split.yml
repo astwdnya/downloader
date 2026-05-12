@@ -33,12 +33,9 @@ jobs:
           FOLDER="${{ github.event.inputs.folder_name }}"
           mkdir -p "$FOLDER/chunks"
 
-          # Get headers once
           HEADERS=$(curl -sI -L "$URL")
 
-          # Try Content-Disposition first
           CD=$(echo "$HEADERS" | grep -i 'content-disposition' | grep -oP 'filename="?\K[^";\r\n]+' | head -1 | tr -d '\r')
-
           if [ -n "$CD" ]; then
             FILENAME="$CD"
             echo "Filename from Content-Disposition: $FILENAME"
@@ -48,43 +45,32 @@ jobs:
             echo "Filename from URL: $FILENAME"
           fi
 
-          # If no extension, detect from Content-Type
           if [[ "$FILENAME" != *.* ]]; then
             CT=$(echo "$HEADERS" | grep -i '^content-type:' | head -1 | tr -d '\r\n ')
-            if echo "$CT" | grep -qi 'video/mp4'; then
-              FILENAME="${FILENAME}.mp4"
-            elif echo "$CT" | grep -qi 'video/webm'; then
-              FILENAME="${FILENAME}.webm"
-            elif echo "$CT" | grep -qi 'video/x-matroska'; then
-              FILENAME="${FILENAME}.mkv"
-            elif echo "$CT" | grep -qi 'image/jpeg'; then
-              FILENAME="${FILENAME}.jpg"
-            elif echo "$CT" | grep -qi 'image/png'; then
-              FILENAME="${FILENAME}.png"
-            elif echo "$CT" | grep -qi 'audio/mpeg'; then
-              FILENAME="${FILENAME}.mp3"
-            elif echo "$CT" | grep -qi 'application/zip'; then
-              FILENAME="${FILENAME}.zip"
-            else
-              FILENAME="${FILENAME}.bin"
+            if   echo "$CT" | grep -qi 'video/mp4';        then FILENAME="${FILENAME}.mp4"
+            elif echo "$CT" | grep -qi 'video/webm';       then FILENAME="${FILENAME}.webm"
+            elif echo "$CT" | grep -qi 'video/x-matroska'; then FILENAME="${FILENAME}.mkv"
+            elif echo "$CT" | grep -qi 'image/jpeg';       then FILENAME="${FILENAME}.jpg"
+            elif echo "$CT" | grep -qi 'image/png';        then FILENAME="${FILENAME}.png"
+            elif echo "$CT" | grep -qi 'audio/mpeg';       then FILENAME="${FILENAME}.mp3"
+            elif echo "$CT" | grep -qi 'application/zip';  then FILENAME="${FILENAME}.zip"
+            else                                                FILENAME="${FILENAME}.bin"
             fi
-            echo "Filename with extension from Content-Type: $FILENAME"
+            echo "Filename with extension: $FILENAME"
           fi
 
           echo "FILENAME=$FILENAME" >> $GITHUB_ENV
           echo "FOLDER=$FOLDER"     >> $GITHUB_ENV
 
-          echo "Downloading: $URL -> $FOLDER/$FILENAME"
+          echo "Downloading: $URL"
           curl -L --retry 5 --retry-delay 3 --retry-all-errors \
                --connect-timeout 30 --max-time 3600 \
-               -o "$FOLDER/$FILENAME" \
-               "$URL"
+               -o "$FOLDER/$FILENAME" "$URL"
 
           SIZE=$(stat -c%s "$FOLDER/$FILENAME")
           echo "Downloaded: $FILENAME  ($SIZE bytes)"
           echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
 
-          # If .bin, detect real type from magic bytes using file command
           if [[ "$FILENAME" == *.bin ]]; then
             MAGIC=$(file --brief "$FOLDER/$FILENAME" | tr '[:upper:]' '[:lower:]')
             if echo "$MAGIC" | grep -q 'mp4\|mpeg\|iso media'; then
@@ -92,17 +78,15 @@ jobs:
               mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
               FILENAME="$NEW"
               echo "FILENAME=$FILENAME" >> $GITHUB_ENV
-              echo "Detected as MP4: $FILENAME"
             elif echo "$MAGIC" | grep -q 'matroska\|webm'; then
               NEW="${FILENAME%.bin}.mkv"
               mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
               FILENAME="$NEW"
               echo "FILENAME=$FILENAME" >> $GITHUB_ENV
-              echo "Detected as MKV: $FILENAME"
             fi
           fi
 
-      - name: Split into chunks and push each one
+      - name: Split and push chunks
         run: |
           FOLDER="${{ github.event.inputs.folder_name }}"
           MAX=94371840
@@ -110,14 +94,18 @@ jobs:
           SIZE=$(stat -c%s "$FOLDER/$FILENAME")
           echo "File: $FILENAME  Size: $SIZE bytes"
 
+          # Save real filename so GUI knows what to name the output
+          echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
+
           if [ "$SIZE" -le "$MAX" ]; then
             echo "Small file, no split needed."
             cp "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_0001_${FILENAME}"
             rm "$FOLDER/$FILENAME"
-            echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
 
+            # Push everything + done.txt in one commit
+            echo "1" > "$FOLDER/chunks/done.txt"
             git add "$FOLDER/"
-            git commit -m "download: $FILENAME [$FOLDER] [ci skip]"
+            git commit -m "download complete: $FILENAME [$FOLDER] [ci skip]"
             git push
 
           else
@@ -125,17 +113,9 @@ jobs:
             split -b "$MAX" -d -a 4 "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_"
             rm "$FOLDER/$FILENAME"
 
-            TOTAL=$(ls "$FOLDER/chunks/" | wc -l)
+            TOTAL=$(ls "$FOLDER/chunks/chunk_"* | wc -l)
             echo "Total chunks: $TOTAL"
             ls -lh "$FOLDER/chunks/"
-
-            # Save real filename
-            echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
-
-            # Push filename.txt first
-            git add "$FOLDER/chunks/filename.txt"
-            git commit -m "meta: filename [$FOLDER] [ci skip]"
-            git push
 
             # Push each chunk one by one
             IDX=0
@@ -144,13 +124,19 @@ jobs:
               CNAME=$(basename "$CHUNK")
               CSIZE=$(stat -c%s "$CHUNK")
               echo "[$IDX/$TOTAL] Pushing $CNAME ($CSIZE bytes)..."
-
               git add "$CHUNK"
               git commit -m "chunk $IDX/$TOTAL: $CNAME [$FOLDER] [ci skip]"
               git push
-
               sleep 2
             done
 
-            echo "All $IDX chunks pushed."
+            # Push filename.txt + done.txt together as the FINAL commit
+            # GUI waits for done.txt — only appears when ALL chunks are done
+            echo "$TOTAL" > "$FOLDER/chunks/done.txt"
+            git add "$FOLDER/chunks/filename.txt"
+            git add "$FOLDER/chunks/done.txt"
+            git commit -m "done: $FILENAME [$TOTAL chunks] [$FOLDER] [ci skip]"
+            git push
+
+            echo "All $TOTAL chunks pushed. done.txt committed."
           fi
