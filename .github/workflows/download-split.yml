@@ -4,15 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to download'
+        description: 'URL to download (xnxx page URL or direct CDN link)'
         required: true
       folder:
         description: 'Output folder name'
         required: true
-      referer:
-        description: 'Referer header (e.g. https://www.xnxx.com)'
-        required: false
-        default: ''
 
 jobs:
   download:
@@ -31,25 +27,76 @@ jobs:
 
       - name: Download and push
         run: |
-          URL="${{ github.event.inputs.url }}"
+          INPUT_URL="${{ github.event.inputs.url }}"
           FOLDER="${{ github.event.inputs.folder }}"
-          REFERER_INPUT="${{ github.event.inputs.referer }}"
           MAX=94371840
 
           mkdir -p "$FOLDER/chunks"
 
-          DOMAIN=$(echo "$URL" | grep -oP 'https?://[^/]+')
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-          # اگر referer مستقیم پاس شده از اون استفاده کن، در غیر این صورت از domain
-          if [ -n "$REFERER_INPUT" ]; then
-            REFERER="$REFERER_INPUT"
+          # ──────────────────────────────────────────────────────────────────
+          # مرحله ۱: اگه URL صفحه xnxx هست، لینک CDN رو از HTML استخراج کن
+          # ──────────────────────────────────────────────────────────────────
+          if echo "$INPUT_URL" | grep -qi 'xnxx\.com/video'; then
+            echo "==> Detected xnxx page URL. Extracting CDN link from server..."
+            REFERER="$INPUT_URL"
+
+            HTML=$(curl -sL \
+              -H "User-Agent: $UA" \
+              -H "Accept: text/html,application/xhtml+xml,*/*" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              --max-time 30 \
+              "$INPUT_URL")
+
+            CDN_URL=""
+
+            # روش ۱: html5player.setVideoUrl('...')
+            CDN_URL=$(echo "$HTML" | grep -oP "html5player\.setVideoUrl\('\K[^']+" | head -1)
+            [ -n "$CDN_URL" ] && echo "Found via setVideoUrl"
+
+            # روش ۲: html5player.setVideoUrlHigh('...')
+            if [ -z "$CDN_URL" ]; then
+              CDN_URL=$(echo "$HTML" | grep -oP "html5player\.setVideoUrlHigh\('\K[^']+" | head -1)
+              [ -n "$CDN_URL" ] && echo "Found via setVideoUrlHigh"
+            fi
+
+            # روش ۳: "url":"https://...mp4..."
+            if [ -z "$CDN_URL" ]; then
+              CDN_URL=$(echo "$HTML" | grep -oP '"url"\s*:\s*"\K[^"]+\.mp4[^"]*' | head -1)
+              [ -n "$CDN_URL" ] && echo "Found via json url key"
+            fi
+
+            # روش ۴: هر URL که xnxx-cdn یا mp4-cdn داشته باشه
+            if [ -z "$CDN_URL" ]; then
+              CDN_URL=$(echo "$HTML" | grep -oP "https://[^\"'<>\s]*(xnxx-cdn|mp4-cdn)[^\"'<>\s]*\.mp4[^\"'<>\s]*" | head -1)
+              [ -n "$CDN_URL" ] && echo "Found via cdn domain pattern"
+            fi
+
+            if [ -z "$CDN_URL" ]; then
+              echo "ERROR: Could not extract CDN URL from xnxx page."
+              echo "--- HTML snippet ---"
+              echo "$HTML" | head -c 2000
+              exit 1
+            fi
+
+            URL="$CDN_URL"
+            echo "==> Extracted CDN URL: $URL"
+
           else
-            REFERER="$DOMAIN/"
+            # لینک مستقیم — همونطور پاس شده
+            URL="$INPUT_URL"
+            REFERER=$(echo "$INPUT_URL" | grep -oP 'https?://[^/]+/')
+            echo "==> Direct URL, no extraction needed."
           fi
-          echo "Using Referer: $REFERER"
 
+          echo "==> Referer: $REFERER"
+
+          # ──────────────────────────────────────────────────────────────────
+          # مرحله ۲: هدرها و نام فایل
+          # ──────────────────────────────────────────────────────────────────
           HEADERS=$(curl -sI -L \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            -H "User-Agent: $UA" \
             -H "Referer: $REFERER" \
             -H "Accept: */*" \
             "$URL")
@@ -78,10 +125,13 @@ jobs:
             echo "Filename with extension: $FILENAME"
           fi
 
+          # ──────────────────────────────────────────────────────────────────
+          # مرحله ۳: دانلود
+          # ──────────────────────────────────────────────────────────────────
           echo "Downloading: $URL  ->  $FILENAME"
           curl -L --retry 5 --retry-delay 3 --retry-all-errors \
                --connect-timeout 30 --max-time 3600 \
-               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+               -H "User-Agent: $UA" \
                -H "Referer: $REFERER" \
                -H "Accept: video/webm,video/mp4,video/*,*/*;q=0.8" \
                -H "Accept-Language: en-US,en;q=0.9" \
@@ -112,6 +162,9 @@ jobs:
 
           echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
 
+          # ──────────────────────────────────────────────────────────────────
+          # مرحله ۴: split و push
+          # ──────────────────────────────────────────────────────────────────
           if [ "$SIZE" -le "$MAX" ]; then
             echo "Small file — no split needed."
             cp "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_0001_${FILENAME}"
