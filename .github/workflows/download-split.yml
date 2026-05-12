@@ -33,36 +33,42 @@ jobs:
           FOLDER="${{ github.event.inputs.folder_name }}"
           mkdir -p "$FOLDER/chunks"
 
-          # Try to get real filename from Content-Disposition header
+          # Get headers once
           HEADERS=$(curl -sI -L "$URL")
-          CD=$(echo "$HEADERS" | grep -i 'content-disposition' | grep -oP 'filename="?\K[^";\r\n]+' | head -1)
+
+          # Try Content-Disposition first
+          CD=$(echo "$HEADERS" | grep -i 'content-disposition' | grep -oP 'filename="?\K[^";\r\n]+' | head -1 | tr -d '\r')
 
           if [ -n "$CD" ]; then
             FILENAME="$CD"
             echo "Filename from Content-Disposition: $FILENAME"
           else
-            # Fall back to URL path, strip query string
             URLPATH="${URL%%\?*}"
             FILENAME=$(basename "$URLPATH")
             echo "Filename from URL: $FILENAME"
           fi
 
-          # If still no extension, try Content-Type
+          # If no extension, detect from Content-Type
           if [[ "$FILENAME" != *.* ]]; then
-            CT=$(echo "$HEADERS" | grep -i '^content-type:' | head -1 | tr -d '\r')
-            case "$CT" in
-              *video/mp4*)   FILENAME="${FILENAME}.mp4" ;;
-              *video/webm*)  FILENAME="${FILENAME}.webm" ;;
-              *video/x-matroska*) FILENAME="${FILENAME}.mkv" ;;
-              *image/jpeg*)  FILENAME="${FILENAME}.jpg" ;;
-              *image/png*)   FILENAME="${FILENAME}.png" ;;
-              *audio/mpeg*)  FILENAME="${FILENAME}.mp3" ;;
-              *application/zip*) FILENAME="${FILENAME}.zip" ;;
-              *application/octet-stream*)
-                # Try to detect from first bytes after download
-                FILENAME="${FILENAME}.bin" ;;
-            esac
-            echo "Filename with extension: $FILENAME"
+            CT=$(echo "$HEADERS" | grep -i '^content-type:' | head -1 | tr -d '\r\n ')
+            if echo "$CT" | grep -qi 'video/mp4'; then
+              FILENAME="${FILENAME}.mp4"
+            elif echo "$CT" | grep -qi 'video/webm'; then
+              FILENAME="${FILENAME}.webm"
+            elif echo "$CT" | grep -qi 'video/x-matroska'; then
+              FILENAME="${FILENAME}.mkv"
+            elif echo "$CT" | grep -qi 'image/jpeg'; then
+              FILENAME="${FILENAME}.jpg"
+            elif echo "$CT" | grep -qi 'image/png'; then
+              FILENAME="${FILENAME}.png"
+            elif echo "$CT" | grep -qi 'audio/mpeg'; then
+              FILENAME="${FILENAME}.mp3"
+            elif echo "$CT" | grep -qi 'application/zip'; then
+              FILENAME="${FILENAME}.zip"
+            else
+              FILENAME="${FILENAME}.bin"
+            fi
+            echo "Filename with extension from Content-Type: $FILENAME"
           fi
 
           echo "FILENAME=$FILENAME" >> $GITHUB_ENV
@@ -78,45 +84,44 @@ jobs:
           echo "Downloaded: $FILENAME  ($SIZE bytes)"
           echo "FILE_SIZE=$SIZE" >> $GITHUB_ENV
 
-          # If file was .bin, detect real type from magic bytes
+          # If .bin, detect real type from magic bytes using file command
           if [[ "$FILENAME" == *.bin ]]; then
-            MAGIC=$(file --brief "$FOLDER/$FILENAME")
-            case "$MAGIC" in
-              *MP4*|*MPEG*|*ISO Media*) 
-                NEW="${FILENAME%.bin}.mp4"
-                mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
-                FILENAME="$NEW"
-                echo "FILENAME=$FILENAME" >> $GITHUB_ENV
-                ;;
-              *Matroska*) 
-                NEW="${FILENAME%.bin}.mkv"
-                mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
-                FILENAME="$NEW"
-                echo "FILENAME=$FILENAME" >> $GITHUB_ENV
-                ;;
-            esac
+            MAGIC=$(file --brief "$FOLDER/$FILENAME" | tr '[:upper:]' '[:lower:]')
+            if echo "$MAGIC" | grep -q 'mp4\|mpeg\|iso media'; then
+              NEW="${FILENAME%.bin}.mp4"
+              mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
+              FILENAME="$NEW"
+              echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+              echo "Detected as MP4: $FILENAME"
+            elif echo "$MAGIC" | grep -q 'matroska\|webm'; then
+              NEW="${FILENAME%.bin}.mkv"
+              mv "$FOLDER/$FILENAME" "$FOLDER/$NEW"
+              FILENAME="$NEW"
+              echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+              echo "Detected as MKV: $FILENAME"
+            fi
           fi
 
       - name: Split into chunks and push each one
         run: |
           FOLDER="${{ github.event.inputs.folder_name }}"
-          MAX=94371840   # 90 MB in bytes
+          MAX=94371840
 
           SIZE=$(stat -c%s "$FOLDER/$FILENAME")
           echo "File: $FILENAME  Size: $SIZE bytes"
 
           if [ "$SIZE" -le "$MAX" ]; then
-            echo "Small file — no split needed."
-            # Single chunk with original filename embedded
+            echo "Small file, no split needed."
             cp "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_0001_${FILENAME}"
             rm "$FOLDER/$FILENAME"
+            echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
 
-            git add "$FOLDER/chunks/chunk_0001_${FILENAME}"
+            git add "$FOLDER/"
             git commit -m "download: $FILENAME [$FOLDER] [ci skip]"
             git push
+
           else
-            echo "Splitting $FILENAME into 90 MB chunks..."
-            # split produces: chunk_0000, chunk_0001, ... (numeric suffix via -d -a 4)
+            echo "Splitting into 90 MB chunks..."
             split -b "$MAX" -d -a 4 "$FOLDER/$FILENAME" "$FOLDER/chunks/chunk_"
             rm "$FOLDER/$FILENAME"
 
@@ -124,30 +129,28 @@ jobs:
             echo "Total chunks: $TOTAL"
             ls -lh "$FOLDER/chunks/"
 
-            # Save total and filename for GUI to know the real name
+            # Save real filename
             echo "$FILENAME" > "$FOLDER/chunks/filename.txt"
 
-            # Push EACH chunk individually to stay under GitHub's 100MB limit
-            i=0
+            # Push filename.txt first
+            git add "$FOLDER/chunks/filename.txt"
+            git commit -m "meta: filename [$FOLDER] [ci skip]"
+            git push
+
+            # Push each chunk one by one
+            IDX=0
             for CHUNK in $(ls "$FOLDER/chunks/chunk_"* | sort); do
+              IDX=$((IDX + 1))
               CNAME=$(basename "$CHUNK")
               CSIZE=$(stat -c%s "$CHUNK")
-              echo "Pushing $CNAME  ($CSIZE bytes)..."
+              echo "[$IDX/$TOTAL] Pushing $CNAME ($CSIZE bytes)..."
 
               git add "$CHUNK"
-              git commit -m "chunk $CNAME [$FOLDER] [ci skip]"
+              git commit -m "chunk $IDX/$TOTAL: $CNAME [$FOLDER] [ci skip]"
               git push
 
-              i=$((i+1))
-              echo "Pushed $i / $TOTAL"
-              # Small pause between pushes to avoid rate limiting
               sleep 2
             done
 
-            # Push filename.txt
-            git add "$FOLDER/chunks/filename.txt"
-            git commit -m "meta: filename.txt [$FOLDER] [ci skip]"
-            git push
-
-            echo "All $TOTAL chunks pushed successfully."
+            echo "All $IDX chunks pushed."
           fi
