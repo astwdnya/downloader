@@ -305,7 +305,7 @@ class DownloaderApp(tk.Tk):
         grid = tk.Frame(cfg_c, bg=BG2)
         grid.pack(fill="x")
         fields = [
-            ("GitHub Token",      "token", True),
+            ("GitHub Token",      "GH_TOKEN", True),
             ("Repo Owner",        "astwdnya",           False),
             ("Repo Name",         "downloader",         False),
             ("Branch",            "main",               False),
@@ -754,9 +754,9 @@ class DownloaderApp(tk.Tk):
     def _download_folder(self, session, token, owner, repo_name,
                          commit_sha, folder, out_dir,
                          original_url, file_idx, total_files):
-        # Original filename from URL (strip query string first)
-        url_path = urlparse(original_url).path
-        fname    = os.path.basename(url_path) or "downloaded_file"
+        # Fallback filename from URL (strip query string first)
+        url_path       = urlparse(original_url).path
+        fname_fallback = os.path.basename(url_path) or "downloaded_file"
 
         resp = session.get(
             f"https://api.github.com/repos/{owner}/{repo_name}"
@@ -772,8 +772,29 @@ class DownloaderApp(tk.Tk):
         if not entries:
             raise Exception("No files found in folder.")
 
+        # Read filename.txt written by workflow (has the real filename)
+        fname = fname_fallback
+        fname_entry = next(
+            (e for e in entries
+             if e["path"].endswith("/chunks/filename.txt")), None)
+        if fname_entry:
+            raw_fn = (
+                "https://raw.githubusercontent.com/"
+                f"{owner}/{repo_name}/{commit_sha}/"
+                f"{fname_entry['path']}")
+            try:
+                r = session.get(raw_fn, timeout=10)
+                r.raise_for_status()
+                name = r.text.strip()
+                if name:
+                    fname = name
+                    self._log_write(f"  Real filename: {fname}", "info")
+            except Exception:
+                pass
+
         chunk_entries = [e for e in entries
                          if "/chunks/" in e["path"]
+                         and not e["path"].endswith("filename.txt")
                          and e.get("size", 0) > 0]
 
         if chunk_entries:
