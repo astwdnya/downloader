@@ -4,28 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       folder_name:
-        description: 'Name of the folder to delete (e.g., 0504233439)'
+        description: "Folder to delete from repo"
         required: true
 
 jobs:
-  delete-folder:
+  delete:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          fetch-depth: 1
 
-      - name: Delete the specified folder
+      - name: Configure Git
         run: |
-          if [ -d "${{ github.event.inputs.folder_name }}" ]; then
-            git rm -rf "${{ github.event.inputs.folder_name }}"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "Delete folder ${{ github.event.inputs.folder_name }} after download"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Delete folder and push
+        run: |
+          FOLDER="${{ github.event.inputs.folder_name }}"
+          if [ -d "$FOLDER" ]; then
+            git rm -rf "$FOLDER"
+            git commit -m "cleanup: remove $FOLDER [ci skip]"
             git push
-            echo "✅ Folder ${{ github.event.inputs.folder_name }} deleted."
+            echo "Deleted: $FOLDER"
           else
-            echo "⚠️ Folder ${{ github.event.inputs.folder_name }} not found – nothing to delete."
+            echo "Folder not found: $FOLDER (already deleted?)"
           fi
